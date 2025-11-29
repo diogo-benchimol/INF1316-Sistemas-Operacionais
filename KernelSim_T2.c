@@ -40,14 +40,15 @@
 /* ---------------- Configuration ---------------- */
 
 #define N_APPS       5
-#define MAX_BLOCKED  N_APPS
+#define MAX_BLOCKED  (N_APPS * 3) /* filas de respostas podem acumular um pouco mais */
 #define MAX_READY    N_APPS
 #define QUANTUM_US   500000     /* 0.5 s quantum for apps/interrupt pacing */
 #define MAX_PC       20         /* max instructions per app */
 #define SYSCALL_PROB 10         /* 1 in SYSCALL_PROB chance per tick */
 
-#define IRQ1_PROB    3  /* 1/3 chance for IRQ1 generation */
-#define IRQ2_PROB    5  /* 1/5 chance for IRQ2 generation */
+/* IRQ probabilities (lower to match spec: ~0.1 for file, ~0.02 for dir) */
+#define IRQ1_PROB_DEN 10  /* 1/IRQ1_PROB_DEN chance for IRQ1 generation */
+#define IRQ2_PROB_DEN 50  /* 1/IRQ2_PROB_DEN chance for IRQ2 generation */
 
 #define SFSS_HOST "127.0.0.1"
 #define SFSS_PORT 8888
@@ -118,6 +119,22 @@ static const char* state_str(int s) {
            s == RUNNING ? "RUNNING" :
            s == BLOCKED ? "BLOCKED" :
            s == TERMINATED ? "TERMINATED" : "?";
+}
+
+static const char* sfp_type_str(SfpMsgType t) {
+    switch (t) {
+        case SFP_MSG_RD_REQ: return "RD_REQ";
+        case SFP_MSG_RD_REP: return "RD_REP";
+        case SFP_MSG_WR_REQ: return "WR_REQ";
+        case SFP_MSG_WR_REP: return "WR_REP";
+        case SFP_MSG_DC_REQ: return "DC_REQ";
+        case SFP_MSG_DC_REP: return "DC_REP";
+        case SFP_MSG_DR_REQ: return "DR_REQ";
+        case SFP_MSG_DR_REP: return "DR_REP";
+        case SFP_MSG_DL_REQ: return "DL_REQ";
+        case SFP_MSG_DL_REP: return "DL_REP";
+        default: return "?";
+    }
 }
 
 /* convert OS pid -> index in pcbs[] or -1 */
@@ -237,7 +254,13 @@ static void print_snapshot(void) {
         PCB *p = &pcbs[i];
         fprintf(stderr, "A%d (PID %d): PC=%d, state=%s", p->id, (int)p->pid, p->pc, state_str(p->state));
         if (p->state == BLOCKED) {
-            fprintf(stderr, ", waiting SFP_MSG %d", p->pending_syscall.msg_type);
+            SfpMessage *ps = &p->pending_syscall;
+            fprintf(stderr, ", waiting %s", sfp_type_str(ps->msg_type));
+            if (ps->path_len > 0) fprintf(stderr, " path=%s", ps->path);
+            if (ps->msg_type == SFP_MSG_RD_REQ || ps->msg_type == SFP_MSG_WR_REQ) {
+                fprintf(stderr, " offset=%d", ps->offset);
+            }
+            if (ps->name_len > 0) fprintf(stderr, " name=%s", ps->name);
         }
         if (p->state == TERMINATED) fprintf(stderr, " (TERMINATED)");
         fprintf(stderr, "\n");
@@ -251,7 +274,38 @@ static void print_snapshot(void) {
     }
     if (running_idx >= 0) fprintf(stderr, "RUNNING: A%d\n", running_idx + 1);
     else fprintf(stderr, "RUNNING: (none)\n");
-    fprintf(stderr, "File-Q: %d waiting / Dir-Q: %d waiting\n", fq_sz, dq_sz);
+
+    fprintf(stderr, "File-Q (%d): ", fq_sz);
+    if (fq_sz == 0) {
+        fprintf(stderr, "(empty)\n");
+    } else {
+        for (int k = 0, i = fq_h; k < fq_sz; ++k, i = (i + 1) % MAX_BLOCKED) {
+            SfpMessage *m = &file_req_q[i];
+            /* status (offset) negativo indica erro, positivo indica sucesso */
+            fprintf(stderr, "[owner=A%d %s path=%s offset=%d status=%d] ",
+                    m->owner, sfp_type_str(m->msg_type), m->path, m->offset, m->offset);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    fprintf(stderr, "Dir-Q (%d): ", dq_sz);
+    if (dq_sz == 0) {
+        fprintf(stderr, "(empty)\n");
+    } else {
+        for (int k = 0, i = dq_h; k < dq_sz; ++k, i = (i + 1) % MAX_BLOCKED) {
+            SfpMessage *m = &dir_req_q[i];
+            fprintf(stderr, "[owner=A%d %s path=%s", m->owner, sfp_type_str(m->msg_type), m->path);
+            if (m->name_len > 0) fprintf(stderr, " name=%s", m->name);
+            /* status ajuda a ver sucesso/erro: path_len para DC/DR, nrnames para DL */
+            if (m->msg_type == SFP_MSG_DC_REP || m->msg_type == SFP_MSG_DR_REP) {
+                fprintf(stderr, " status=%d", m->path_len);
+            } else if (m->msg_type == SFP_MSG_DL_REP) {
+                fprintf(stderr, " status=%d", m->nrnames);
+            }
+            fprintf(stderr, "] ");
+        }
+        fprintf(stderr, "\n");
+    }
     fprintf(stderr, "=============================================================\n");
 }
 
@@ -274,11 +328,11 @@ static void run_interrupt_controller(void) {
         kill(getppid(), SIGUSR1);
 
         /* probabilistic IRQ1 / IRQ2 */
-        if (rand() % IRQ1_PROB == 0) {
+        if (rand() % IRQ1_PROB_DEN == 0) {
             writeln(STDOUT_FILENO, "IRQ1\n");
             kill(getppid(), SIGUSR1);
         }
-        if (rand() % IRQ2_PROB == 0) {
+        if (rand() % IRQ2_PROB_DEN == 0) {
             writeln(STDOUT_FILENO, "IRQ2\n");
             kill(getppid(), SIGUSR1);
         }
@@ -359,19 +413,20 @@ static void run_app(int id) {
         if (rand() % SYSCALL_PROB == 0) {
             char msg[1024];
             int op_type = rand() % 5; /* 0=read,1=write,2=add,3=rem,4=list */
+            /* offsets sempre em {0,16,32,48,64,80,96} conforme enunciado */
+            int offset_index = rand() % 7;
+            int offset = offset_index * 16;
 
             switch (op_type) {
                 case 0: { /* READ */
                     char path[128];
                     snprintf(path, sizeof(path), "/A%d/file.txt", (rand()%2==0)?id:0);
-                    int offset = (rand() % 4) * 16;
                     snprintf(msg, sizeof(msg), "READ A%d %d %s %d\n", id, (int)getpid(), path, offset);
                     break;
                 }
                 case 1: { /* WRITE */
                     char path[128];
                     snprintf(path, sizeof(path), "/A%d/file.txt", (rand()%2==0)?id:0);
-                    int offset = (rand() % 4) * 16;
                     snprintf(msg, sizeof(msg), "WRITE A%d %d %s %d HelloA%dPC%d\n",
                              id, (int)getpid(), path, offset, id, pc);
                     break;
@@ -472,8 +527,8 @@ static void handle_sfs_reply(void) {
         return;
     }
 
-    fprintf(stderr, "[Kernel] Received SFP msg %d from SFSS for owner %d\n",
-            res_msg.msg_type, res_msg.owner);
+    fprintf(stderr, "[Kernel] Received SFP msg %s from SFSS for owner A%d\n",
+            sfp_type_str(res_msg.msg_type), res_msg.owner);
 
     switch (res_msg.msg_type) {
         case SFP_MSG_RD_REP:
@@ -483,7 +538,8 @@ static void handle_sfs_reply(void) {
                 fq_t = (fq_t + 1) % MAX_BLOCKED;
                 fq_sz++;
             } else {
-                fprintf(stderr, "[Kernel] File queue full — dropping reply\n");
+                fprintf(stderr, "[Kernel] File queue full - dropping reply owner=A%d type=%s path=%s\n",
+                        res_msg.owner, sfp_type_str(res_msg.msg_type), res_msg.path);
             }
             break;
 
@@ -495,12 +551,70 @@ static void handle_sfs_reply(void) {
                 dq_t = (dq_t + 1) % MAX_BLOCKED;
                 dq_sz++;
             } else {
-                fprintf(stderr, "[Kernel] Dir queue full — dropping reply\n");
+                fprintf(stderr, "[Kernel] Dir queue full - dropping reply owner=A%d type=%s path=%s\n",
+                        res_msg.owner, sfp_type_str(res_msg.msg_type), res_msg.path);
             }
             break;
 
         default:
-            fprintf(stderr, "[Kernel] Unknown reply type from SFSS: %d\n", res_msg.msg_type);
+            fprintf(stderr, "[Kernel] Unknown reply type from SFSS: %s\n", sfp_type_str(res_msg.msg_type));
+    }
+}
+
+/* ---------------- Kernel: synthesize error reply locally ---------------- */
+
+static void deliver_error_reply(int idx, const SfpMessage *req, int errcode) {
+    if (idx < 0 || idx >= N_APPS) return;
+    if (pcbs[idx].state == TERMINATED) return;
+
+    SfpMessage rep;
+    memset(&rep, 0, sizeof(rep));
+    rep.owner = req->owner;
+    strncpy(rep.path, req->path, SFP_MAX_PATH_LEN);
+    rep.path[SFP_MAX_PATH_LEN - 1] = '\0';
+    rep.path_len = req->path_len;
+    strncpy(rep.name, req->name, SFP_MAX_PATH_LEN);
+    rep.name[SFP_MAX_PATH_LEN - 1] = '\0';
+    rep.name_len = req->name_len;
+
+    switch (req->msg_type) {
+        case SFP_MSG_RD_REQ:
+            rep.msg_type = SFP_MSG_RD_REP;
+            rep.offset = errcode;
+            break;
+        case SFP_MSG_WR_REQ:
+            rep.msg_type = SFP_MSG_WR_REP;
+            rep.offset = errcode;
+            break;
+        case SFP_MSG_DC_REQ:
+            rep.msg_type = SFP_MSG_DC_REP;
+            rep.path_len = errcode;
+            break;
+        case SFP_MSG_DR_REQ:
+            rep.msg_type = SFP_MSG_DR_REP;
+            rep.path_len = errcode;
+            break;
+        case SFP_MSG_DL_REQ:
+            rep.msg_type = SFP_MSG_DL_REP;
+            rep.nrnames = errcode;
+            break;
+        default:
+            rep.msg_type = req->msg_type;
+            rep.offset = errcode;
+            break;
+    }
+
+    memcpy(shm_ptrs[idx], &rep, sizeof(rep));
+    pcbs[idx].state = READY;
+    rq_push_tail(idx);
+    fprintf(stderr, "[Kernel] Validation error for A%d -> synthesized reply code=%d\n", idx + 1, errcode);
+
+    /* If it was the running process, force reschedule */
+    if (running_idx == idx) {
+        running_idx = -1;
+        schedule_next();
+    } else if (running_idx == -1) {
+        schedule_next();
     }
 }
 
@@ -553,6 +667,8 @@ static void drain_inter(void) {
                 } else {
                     fprintf(stderr, "[Kernel] IRQ1 -> WARN owner A%d not found or not blocked\n", owner);
                 }
+            } else {
+                fprintf(stderr, "[Kernel] IRQ1 received but file queue empty\n");
             }
         } else if (strcmp(line, "IRQ2") == 0) {
             /* Dir I/O done: pop dir_req_q and unblock owner */
@@ -573,6 +689,8 @@ static void drain_inter(void) {
                 } else {
                     fprintf(stderr, "[Kernel] IRQ2 -> WARN owner A%d not found or not blocked\n", owner);
                 }
+            } else {
+                fprintf(stderr, "[Kernel] IRQ2 received but dir queue empty\n");
             }
         } else {
             fprintf(stderr, "[Kernel] Unknown IRQ line: '%s'\n", line);
@@ -628,6 +746,8 @@ static void drain_apps(void) {
             char name_buf[SFP_MAX_PATH_LEN];
             char payload_buf[SFP_PAYLOAD_SIZE + 32];
             int offset = 0;
+            int validation_err = SFP_SUCCESS;
+            int parsed = 0;
 
             if (sscanf(line, "READ A%d %d %s %d", &aid, &pid, path_buf, &offset) == 4) {
                 idx = pid_to_index((pid_t)pid);
@@ -637,6 +757,7 @@ static void drain_apps(void) {
                 req_msg.path[SFP_MAX_PATH_LEN - 1] = '\0';
                 req_msg.path_len = strlen(req_msg.path);
                 req_msg.offset = offset;
+                parsed = 1;
 
             } else if (sscanf(line, "WRITE A%d %d %s %d %s", &aid, &pid, path_buf, &offset, payload_buf) == 5) {
                 idx = pid_to_index((pid_t)pid);
@@ -649,6 +770,7 @@ static void drain_apps(void) {
                 /* copy payload (truncate/pad to SFP_PAYLOAD_SIZE) */
                 memset(req_msg.payload, 0, SFP_PAYLOAD_SIZE);
                 strncpy(req_msg.payload, payload_buf, SFP_PAYLOAD_SIZE);
+                parsed = 1;
 
             } else if (sscanf(line, "ADD A%d %d %s %s", &aid, &pid, path_buf, name_buf) == 4) {
                 idx = pid_to_index((pid_t)pid);
@@ -660,6 +782,7 @@ static void drain_apps(void) {
                 strncpy(req_msg.name, name_buf, SFP_MAX_PATH_LEN);
                 req_msg.name[SFP_MAX_PATH_LEN - 1] = '\0';
                 req_msg.name_len = strlen(req_msg.name);
+                parsed = 1;
 
             } else if (sscanf(line, "REM A%d %d %s %s", &aid, &pid, path_buf, name_buf) == 4) {
                 idx = pid_to_index((pid_t)pid);
@@ -671,6 +794,7 @@ static void drain_apps(void) {
                 strncpy(req_msg.name, name_buf, SFP_MAX_PATH_LEN);
                 req_msg.name[SFP_MAX_PATH_LEN - 1] = '\0';
                 req_msg.name_len = strlen(req_msg.name);
+                parsed = 1;
 
             } else if (sscanf(line, "LISTDIR A%d %d %s", &aid, &pid, path_buf) == 3) {
                 idx = pid_to_index((pid_t)pid);
@@ -679,33 +803,53 @@ static void drain_apps(void) {
                 strncpy(req_msg.path, path_buf, SFP_MAX_PATH_LEN);
                 req_msg.path[SFP_MAX_PATH_LEN - 1] = '\0';
                 req_msg.path_len = strlen(req_msg.path);
+                parsed = 1;
             } else {
                 /* unknown line */
                 fprintf(stderr, "[Kernel] Unknown app line: '%s'\n", line);
             }
 
-            if (idx != -1) {
-                if (idx >= 0 && pcbs[idx].state != TERMINATED) {
-                    /* block the process and save pending syscall for snapshot */
-                    pcbs[idx].state = BLOCKED;
-                    pcbs[idx].pending_syscall = req_msg;
-                    fprintf(stderr, "[Kernel] SYSCALL A%d (PID %d): MSG %d -> BLOCKED\n",
-                            idx + 1, pid, req_msg.msg_type);
+            if (parsed && idx != -1 && idx >= 0 && pcbs[idx].state != TERMINATED) {
+                /* basic validations */
+                if ((req_msg.msg_type == SFP_MSG_RD_REQ || req_msg.msg_type == SFP_MSG_WR_REQ) &&
+                    (req_msg.offset < 0 || (req_msg.offset % SFP_PAYLOAD_SIZE) != 0)) {
+                    validation_err = SFP_ERR_OFFSET_OOB;
+                }
+                if (req_msg.path_len <= 0 || req_msg.path_len >= SFP_MAX_PATH_LEN) {
+                    validation_err = SFP_ERR_IO;
+                }
+                if ((req_msg.msg_type == SFP_MSG_DC_REQ || req_msg.msg_type == SFP_MSG_DR_REQ) &&
+                    (req_msg.name_len <= 0 || req_msg.name_len >= SFP_MAX_PATH_LEN)) {
+                    validation_err = SFP_ERR_IO;
+                }
 
-                    /* send request to SFSS via UDP */
-                    ssize_t sent = sendto(udp_sockfd, &req_msg, sizeof(SfpMessage), 0,
-                                          (struct sockaddr*)&sfss_addr, sizeof(sfss_addr));
-                    if (sent < 0) {
-                        perror("[Kernel] sendto failed");
-                    }
+                if (validation_err != SFP_SUCCESS) {
+                    deliver_error_reply(idx, &req_msg, validation_err);
+                    continue;
+                }
 
-                    /* remove from CPU if it was running */
-                    if (idx == running_idx) {
-                        running_idx = -1;
-                        schedule_next();
-                    } else if (running_idx == -1) {
-                        schedule_next();
-                    }
+                /* block the process and save pending syscall for snapshot */
+                pcbs[idx].state = BLOCKED;
+                pcbs[idx].pending_syscall = req_msg;
+                fprintf(stderr, "[Kernel] SYSCALL A%d (PID %d): MSG %d -> BLOCKED\n",
+                        idx + 1, pid, req_msg.msg_type);
+
+                /* Envia requisicao ao SFSS */
+                ssize_t sent = sendto(udp_sockfd, &req_msg, sizeof(SfpMessage), 0,
+                                      (struct sockaddr*)&sfss_addr, sizeof(sfss_addr));
+                if (sent < 0) {
+                    /* Se falhar, nao deixe o processo BLOCKED para sempre */
+                    perror("[Kernel] sendto failed");
+                    deliver_error_reply(idx, &req_msg, SFP_ERR_IO);
+                    continue;
+                }
+
+                /* remove from CPU se estava rodando */
+                if (idx == running_idx) {
+                    running_idx = -1;
+                    schedule_next();
+                } else if (running_idx == -1) {
+                    schedule_next();
                 }
             }
         }

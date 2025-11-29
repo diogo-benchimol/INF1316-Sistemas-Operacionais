@@ -17,14 +17,27 @@
 // Variável global para o diretório raiz
 const char* SFSS_ROOT_DIR = NULL;
 
-// --- T2-FIX: Nova Função de Validação de Permissão ---
+/* Rejeita sequencias ".." para evitar fuga do diretorio raiz */
+static int contains_dotdot(const char* s) {
+    if (!s) return 0;
+    return strstr(s, "..") != NULL;
+}
+
+// --- T2-FIX: Nova Funcao de Validacao de Permissao ---
 // Checa se o 'owner' pode acessar o 'path'
 // Retorna 1 (true) se permitido, 0 (false) se negado.
 int check_permission(int owner, const char* path, int path_len) {
-    // Constrói os dois prefixos válidos
+    if (path == NULL) return 0;
+    if (path_len <= 0) path_len = strlen(path);
+    if (path_len <= 0 || path_len >= SFP_MAX_PATH_LEN) return 0;
+    if (contains_dotdot(path)) return 0;
+
+    /* Regra: /A0 é compartilhado para owners 1..5; /Ax só para o próprio owner (1..5) */
+    if (owner < 1 || owner > 5) return 0;
+
     char owner_prefix[10]; // Ex: /A5
     snprintf(owner_prefix, 10, "/A%d", owner);
-    char shared_prefix[] = "/A0";
+    const char shared_prefix[] = "/A0";
 
     int owner_prefix_len = strlen(owner_prefix);
     int shared_prefix_len = strlen(shared_prefix);
@@ -32,30 +45,21 @@ int check_permission(int owner, const char* path, int path_len) {
     int is_owner_path = (strncmp(path, owner_prefix, owner_prefix_len) == 0);
     int is_shared_path = (strncmp(path, shared_prefix, shared_prefix_len) == 0);
 
-    int is_valid = 0;
-
-    // Checa o path do dono (Ex: /A5)
-    if (is_owner_path) {
-        // Checa se é /A5 (exato) ou /A5/... (subdiretório)
-        // Isso previne que /A5 acesse /A50
-        if (path_len == owner_prefix_len) { // Exatamente /A5
-            is_valid = 1; 
-        } else if (path[owner_prefix_len] == '/') { // É /A5/...
-            is_valid = 1;
-        }
-    }
-
     // Checa o path compartilhado (Ex: /A0)
     if (is_shared_path) {
-        // Checa se é /A0 (exato) ou /A0/...
-        if (path_len == shared_prefix_len) { // Exatamente /A0
-            is_valid = 1;
-        } else if (path[shared_prefix_len] == '/') { // É /A0/...
-            is_valid = 1;
-        }
+        // /A0 pode ser acessado por qualquer owner 1..5
+        if (path_len == shared_prefix_len) return 1; // Exatamente /A0
+        if (path[shared_prefix_len] == '/') return 1; // É /A0/...
+        return 0;
     }
 
-    return is_valid;
+    // Checa o path do dono (Ex: /A5) -> somente se owner == prefixo
+    if (is_owner_path) {
+        if (path_len == owner_prefix_len) return 1; // Exatamente /Ax
+        if (path[owner_prefix_len] == '/') return 1; // É /Ax/...
+    }
+
+    return 0;
 }
 
 
@@ -70,21 +74,35 @@ void handle_rd_req(const SfpMessage* req, SfpMessage* res) {
     res->offset = req->offset;
     memset(res->payload, 0, SFP_PAYLOAD_SIZE);
 
-    // 2. Validação de Permissões (CORRIGIDO)
-    if (!check_permission(req->owner, req->path, strlen(req->path))) {
-        printf("Servidor: ERRO (RD) Permissão negada. Owner %d tenta acessar %s\n", req->owner, req->path);
+    int path_len = (req->path_len > 0) ? req->path_len : (int)strlen(req->path);
+
+    /* 2. Validação de alinhamento/tamanho */
+    if (req->offset < 0 || (req->offset % SFP_PAYLOAD_SIZE) != 0) {
+        printf("Servidor: ERRO (RD) Offset invalido: %d\n", req->offset);
+        res->offset = SFP_ERR_OFFSET_OOB;
+        return;
+    }
+    if (path_len <= 0 || path_len >= SFP_MAX_PATH_LEN) {
+        printf("Servidor: ERRO (RD) Path len invalido: %d\n", path_len);
+        res->offset = SFP_ERR_IO;
+        return;
+    }
+
+    // 3. Validação de Permissões e segurança de path
+    if (!check_permission(req->owner, req->path, path_len)) {
+        printf("Servidor: ERRO (RD) Permissao negada. Owner %d tenta acessar %s\n", req->owner, req->path);
         res->offset = SFP_ERR_PERMISSION; // Retorna erro
         return;
     }
 
-    // 3. Construção do Path Real
+    // 4. Construção do Path Real
     char full_path[SFP_MAX_PATH_LEN + 256];
     snprintf(full_path, sizeof(full_path), "%s%s", SFSS_ROOT_DIR, req->path);
 
-    // 4. Operação de Arquivo
+    // 5. Operação de Arquivo
     FILE *file = fopen(full_path, "rb");
     if (file == NULL) {
-        printf("Servidor: ERRO (RD) Arquivo não encontrado: %s\n", full_path);
+        printf("Servidor: ERRO (RD) Arquivo nao encontrado: %s\n", full_path);
         res->offset = SFP_ERR_NOT_FOUND;
         return;
     }
@@ -116,29 +134,30 @@ void handle_wr_req(const SfpMessage* req, SfpMessage* res) {
     memset(res->payload, 0, SFP_PAYLOAD_SIZE);
     res->offset = req->offset; 
 
-    // 2. Validação de Permissões (CORRIGIDO)
-    if (!check_permission(req->owner, req->path, strlen(req->path))) {
-        printf("Servidor: ERRO (WR) Permissão negada. Owner %d tenta acessar %s\n", req->owner, req->path);
+    int path_len = (req->path_len > 0) ? req->path_len : (int)strlen(req->path);
+
+    /* 2. Validação de alinhamento/tamanho */
+    if (req->offset < 0 || (req->offset % SFP_PAYLOAD_SIZE) != 0) {
+        printf("Servidor: ERRO (WR) Offset invalido: %d\n", req->offset);
+        res->offset = SFP_ERR_OFFSET_OOB;
+        return;
+    }
+    if (path_len <= 0 || path_len >= SFP_MAX_PATH_LEN) {
+        printf("Servidor: ERRO (WR) Path len invalido: %d\n", path_len);
+        res->offset = SFP_ERR_IO;
+        return;
+    }
+
+    // 3. Validação de Permissões (segurança de path)
+    if (!check_permission(req->owner, req->path, path_len)) {
+        printf("Servidor: ERRO (WR) Permissao negada. Owner %d tenta acessar %s\n", req->owner, req->path);
         res->offset = SFP_ERR_PERMISSION;
         return;
     }
 
-    // 3. Construção do Path Real
+    // 4. Construção do Path Real
     char full_path[SFP_MAX_PATH_LEN + 256];
     snprintf(full_path, sizeof(full_path), "%s%s", SFSS_ROOT_DIR, req->path);
-
-    // 4. Lógica de Remoção
-    if (req->offset == 0 && req->payload[0] == '\0') {
-        printf("Servidor: (WR) Lógica de REMOÇÃO ativada para %s\n", full_path);
-        if (unlink(full_path) == 0) {
-            printf("Servidor: (WR) Arquivo removido com sucesso.\n");
-            res->offset = 0;
-        } else {
-            perror("Servidor: ERRO (WR) falha ao remover arquivo");
-            res->offset = SFP_ERR_IO;
-        }
-        return;
-    }
 
     // 5. Lógica de Escrita / Criação
     FILE *file = fopen(full_path, "r+b"); 
@@ -191,21 +210,44 @@ void handle_dc_req(const SfpMessage* req, SfpMessage* res) {
     res->msg_type = SFP_MSG_DC_REP;
     res->owner = req->owner;
 
-    // 2. Validação de Permissões (CORRIGIDO)
-    // A permissão é checada no 'path' base onde o diretório será criado
-    if (!check_permission(req->owner, req->path, strlen(req->path))) {
-        printf("Servidor: ERRO (DC) Permissão negada. Owner %d tenta criar em %s\n", req->owner, req->path);
+    int path_len = (req->path_len > 0) ? req->path_len : (int)strlen(req->path);
+    int name_len = (req->name_len > 0) ? req->name_len : (int)strlen(req->name);
+
+    // 2. Validação de tamanhos e segurança de path
+    if (path_len <= 0 || path_len >= SFP_MAX_PATH_LEN ||
+        name_len <= 0 || name_len >= SFP_MAX_PATH_LEN) {
+        strcpy(res->path, req->path);
+        res->path_len = SFP_ERR_IO;
+        return;
+    }
+    if (contains_dotdot(req->path) || contains_dotdot(req->name)) {
+        strcpy(res->path, req->path);
+        res->path_len = SFP_ERR_PERMISSION;
+        return;
+    }
+
+    char combined_path[SFP_MAX_PATH_LEN];
+    int combined_len = snprintf(combined_path, sizeof(combined_path), "%s/%s", req->path, req->name);
+    if (combined_len < 0 || combined_len >= SFP_MAX_PATH_LEN) {
+        strcpy(res->path, req->path);
+        res->path_len = SFP_ERR_IO;
+        return;
+    }
+
+    // 3. Validação de Permissões (aplica no path completo)
+    if (!check_permission(req->owner, combined_path, combined_len)) {
+        printf("Servidor: ERRO (DC) Permissao negada. Owner %d tenta criar em %s\n", req->owner, combined_path);
         strcpy(res->path, req->path);
         res->path_len = SFP_ERR_PERMISSION; // Retorna erro
         return;
     }
 
-    // 3. Construção do Path Real
+    // 4. Construção do Path Real
     char full_new_path[SFP_MAX_PATH_LEN + 256];
     snprintf(full_new_path, sizeof(full_new_path), "%s%s/%s", 
              SFSS_ROOT_DIR, req->path, req->name);
 
-    // 4. Operação de Criação de Diretório
+    // 5. Operação de Criação de Diretório
     if (mkdir(full_new_path, 0755) == 0) {
         printf("Servidor: (DC) Diretório criado: %s\n", full_new_path);
         snprintf(res->path, SFP_MAX_PATH_LEN, "%s/%s", req->path, req->name);
@@ -223,19 +265,40 @@ void handle_dr_req(const SfpMessage* req, SfpMessage* res) {
     res->owner = req->owner;
     strcpy(res->path, req->path); 
 
-    // 2. Validação de Permissões (CORRIGIDO)
-    if (!check_permission(req->owner, req->path, strlen(req->path))) {
-        printf("Servidor: ERRO (DR) Permissão negada. Owner %d tenta remover de %s\n", req->owner, req->path);
+    int path_len = (req->path_len > 0) ? req->path_len : (int)strlen(req->path);
+    int name_len = (req->name_len > 0) ? req->name_len : (int)strlen(req->name);
+
+    // 2. Validação de tamanhos e segurança de path
+    if (path_len <= 0 || path_len >= SFP_MAX_PATH_LEN ||
+        name_len <= 0 || name_len >= SFP_MAX_PATH_LEN) {
+        res->path_len = SFP_ERR_IO;
+        return;
+    }
+    if (contains_dotdot(req->path) || contains_dotdot(req->name)) {
         res->path_len = SFP_ERR_PERMISSION;
         return;
     }
 
-    // 3. Construção do Path Real
+    char combined_path[SFP_MAX_PATH_LEN];
+    int combined_len = snprintf(combined_path, sizeof(combined_path), "%s/%s", req->path, req->name);
+    if (combined_len < 0 || combined_len >= SFP_MAX_PATH_LEN) {
+        res->path_len = SFP_ERR_IO;
+        return;
+    }
+
+    // 3. Validação de Permissões (aplica no path completo)
+    if (!check_permission(req->owner, combined_path, combined_len)) {
+        printf("Servidor: ERRO (DR) Permissao negada. Owner %d tenta remover de %s\n", req->owner, combined_path);
+        res->path_len = SFP_ERR_PERMISSION;
+        return;
+    }
+
+    // 4. Construção do Path Real
     char full_target_path[SFP_MAX_PATH_LEN + 256];
     snprintf(full_target_path, sizeof(full_target_path), "%s%s/%s", 
              SFSS_ROOT_DIR, req->path, req->name);
 
-    // 4. Operação de Remoção
+    // 5. Operação de Remoção
     int status = unlink(full_target_path);
     if (status != 0) {
         status = rmdir(full_target_path);
@@ -250,6 +313,7 @@ void handle_dr_req(const SfpMessage* req, SfpMessage* res) {
 }
 
 void handle_dl_req(const SfpMessage* req, SfpMessage* res) {
+
     // 1. Inicializa a Resposta
     res->msg_type = SFP_MSG_DL_REP;
     res->owner = req->owner;
@@ -257,21 +321,29 @@ void handle_dl_req(const SfpMessage* req, SfpMessage* res) {
     memset(res->allfilenames, 0, SFP_MAX_ALLFILENAMES_LEN);
     memset(res->fstlstpositions, 0, sizeof(SfpFstLst) * SFP_MAX_NAMES_IN_DIR);
 
-    // 2. Validação de Permissões (CORRIGIDO)
-    if (!check_permission(req->owner, req->path, strlen(req->path))) {
-        printf("Servidor: ERRO (DL) Permissão negada. Owner %d tenta listar %s\n", req->owner, req->path);
+    int path_len = (req->path_len > 0) ? req->path_len : (int)strlen(req->path);
+
+    // 2. Validacao de tamanhos e seguranca de path
+    if (path_len <= 0 || path_len >= SFP_MAX_PATH_LEN || contains_dotdot(req->path)) {
+        res->nrnames = SFP_ERR_IO;
+        return;
+    }
+
+    // 3. Validacao de Permissoes (CORRIGIDO)
+    if (!check_permission(req->owner, req->path, path_len)) {
+        printf("Servidor: ERRO (DL) Permissao negada. Owner %d tenta listar %s\n", req->owner, req->path);
         res->nrnames = SFP_ERR_PERMISSION;
         return;
     }
 
-    // 3. Construção do Path Real
+    // 4. Construcao do Path Real
     char full_path[SFP_MAX_PATH_LEN + 256];
     snprintf(full_path, sizeof(full_path), "%s%s", SFSS_ROOT_DIR, req->path);
 
-    // 4. Operação de Leitura de Diretório
+    // 5. Operacao de Leitura de Diretorio
     DIR *d = opendir(full_path);
     if (d == NULL) {
-        perror("Servidor: ERRO (DL) falha ao abrir diretório");
+        perror("Servidor: ERRO (DL) falha ao abrir diretorio");
         res->nrnames = SFP_ERR_NOT_FOUND;
         return;
     }
@@ -279,18 +351,21 @@ void handle_dl_req(const SfpMessage* req, SfpMessage* res) {
     struct dirent *dir_entry;
     int current_name_index = 0;
     int current_char_index = 0;
+    int overflowed = 0;
 
     while ((dir_entry = readdir(d)) != NULL) {
         if (strcmp(dir_entry->d_name, ".") == 0 || strcmp(dir_entry->d_name, "..") == 0) {
             continue;
         }
         if (current_name_index >= SFP_MAX_NAMES_IN_DIR) {
+            overflowed = 1;
             break; 
         }
 
         char* name = dir_entry->d_name;
         int name_len = strlen(name);
         if (current_char_index + name_len >= SFP_MAX_ALLFILENAMES_LEN) {
+            overflowed = 1;
             break;
         }
 
@@ -313,10 +388,17 @@ void handle_dl_req(const SfpMessage* req, SfpMessage* res) {
         current_name_index++;
     }
     closedir(d);
-    res->nrnames = current_name_index;
-    printf("Servidor: (DL) Sucesso. Listando %d itens de %s\n", res->nrnames, full_path);
+    if (overflowed) {
+        /* Em caso de overflow, limpamos buffers para evitar lixo em erro */
+        memset(res->allfilenames, 0, SFP_MAX_ALLFILENAMES_LEN);
+        memset(res->fstlstpositions, 0, sizeof(SfpFstLst) * SFP_MAX_NAMES_IN_DIR);
+        res->nrnames = SFP_ERR_IO;
+        printf("Servidor: ERRO (DL) Overflow listando %s\n", full_path);
+    } else {
+        res->nrnames = current_name_index;
+        printf("Servidor: (DL) Sucesso. Listando %d itens de %s\n", res->nrnames, full_path);
+    }
 }
-
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
