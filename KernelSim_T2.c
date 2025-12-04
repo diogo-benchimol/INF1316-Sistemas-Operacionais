@@ -44,11 +44,11 @@
 #define MAX_READY    N_APPS
 #define QUANTUM_US   500000     /* 0.5 s quantum for apps/interrupt pacing */
 #define MAX_PC       20         /* max instructions per app */
-#define SYSCALL_PROB 10         /* 1 in SYSCALL_PROB chance per tick */
+#define SYSCALL_PROB 20         /* 1 in SYSCALL_PROB chance per tick */
 
 /* IRQ probabilities (lower to match spec: ~0.1 for file, ~0.02 for dir) */
 #define IRQ1_PROB_DEN 10  /* 1/IRQ1_PROB_DEN chance for IRQ1 generation */
-#define IRQ2_PROB_DEN 50  /* 1/IRQ2_PROB_DEN chance for IRQ2 generation */
+#define IRQ2_PROB_DEN 20  /* 1/IRQ2_PROB_DEN chance for IRQ2 generation */
 
 #define SFSS_HOST "127.0.0.1"
 #define SFSS_PORT 8888

@@ -1,0 +1,11 @@
+Servidor: ERRO (DR) falha ao remover item: No such file or directory
+Servidor SFSS iniciando. Raiz: sfss_root
+Servidor SFSS aguardando na porta 8888...
+Servidor: (DC) Diretório criado: sfss_root/A3/newDir_A3_3
+Servidor: (DL) Sucesso. Listando 0 itens de sfss_root/A0
+Servidor: (DL) Sucesso. Listando 0 itens de sfss_root/A0
+Servidor: (DC) Diretório criado: sfss_root/A2/newDir_A2_17
+Servidor: (DL) Sucesso. Listando 0 itens de sfss_root/A0
+Servidor: (WR) Arquivo não existe. Criando sfss_root/A0/file.txt...
+Servidor: (WR) Offset > tamanho. Preenchendo buraco de 0 até 16
+Servi
