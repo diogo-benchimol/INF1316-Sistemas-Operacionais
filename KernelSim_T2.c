@@ -43,14 +43,14 @@
 #define MAX_BLOCKED  (N_APPS * 3) /* Tam. das filas de respostas (arquivo/dir) vindas do SFSS */
 #define MAX_READY    N_APPS       /* No máx. todos os apps podem estar READY */
 #define QUANTUM_US   500000       /* 0.5 s quantum para apps e IC */
-#define MAX_PC       20           /* Máx. “instruções” (iterações) por app */
-#define SYSCALL_PROB 20           /* Chance de 1/SYSCALL_PROB de syscall por tick */
+#define MAX_PC       5          /* Máx. “instruções” (iterações) por app */
+#define SYSCALL_PROB 10           /* Chance de 1/SYSCALL_PROB de syscall por tick */
 
-/* IRQ probabilities (lower to match spec: ~0.1 for file, ~0.02 for dir) */
+/* IRQ probabilities */
 #define IRQ1_PROB_DEN 10  /* 1/IRQ1_PROB_DEN chance para IRQ1 (arquivo) */
 #define IRQ2_PROB_DEN 20  /* 1/IRQ2_PROB_DEN chance para IRQ2 (diretório) */
 
-#define SFSS_HOST "127.0.0.1"  /* SFSS local (poderia ser IP remoto) */
+#define SFSS_HOST "127.0.0.1"  
 #define SFSS_PORT 8888         /* Porta do servidor de arquivos */
 
 #define SHM_KEY_BASE 0x1316    /* Base para gerar uma shmem por app */
