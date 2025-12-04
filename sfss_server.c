@@ -65,6 +65,14 @@ int check_permission(int owner, const char* path, int path_len) {
 
 // --- Funções de Manipulação ---
 
+/* Verifica se payload de 16 bytes está vazio (todos zero) para suportar deleção via WR */
+static int payload_vazio(const char *p) {
+    for (int i = 0; i < SFP_PAYLOAD_SIZE; i++) {
+        if (p[i] != 0) return 0;
+    }
+    return 1;
+}
+
 void handle_rd_req(const SfpMessage* req, SfpMessage* res) {
     // 1. Inicializa a Resposta
     res->msg_type = SFP_MSG_RD_REP;
@@ -159,7 +167,20 @@ void handle_wr_req(const SfpMessage* req, SfpMessage* res) {
     char full_path[SFP_MAX_PATH_LEN + 256];
     snprintf(full_path, sizeof(full_path), "%s%s", SFSS_ROOT_DIR, req->path);
 
-    // 5. Lógica de Escrita / Criação
+    // 5. Lógica de deleção via WR (offset 0 + payload vazio)
+    if (req->offset == 0 && payload_vazio(req->payload)) {
+        if (unlink(full_path) == 0) {
+            printf("Servidor: (WR) Arquivo removido via WR vazio: %s\n", full_path);
+            res->offset = 0;
+            return;
+        } else {
+            perror("Servidor: ERRO (WR) falha ao remover arquivo via WR");
+            res->offset = SFP_ERR_IO;
+            return;
+        }
+    }
+
+    // 6. Lógica de Escrita / Criação
     FILE *file = fopen(full_path, "r+b"); 
     if (file == NULL) {
         printf("Servidor: (WR) Arquivo não existe. Criando %s...\n", full_path);
@@ -171,7 +192,7 @@ void handle_wr_req(const SfpMessage* req, SfpMessage* res) {
         }
     }
 
-    // 6. Lógica de "Buracos"
+    // 7. Lógica de "Buracos"
     fseek(file, 0, SEEK_END);
     long file_size = ftell(file);
     if (req->offset > file_size) {
@@ -188,7 +209,7 @@ void handle_wr_req(const SfpMessage* req, SfpMessage* res) {
         }
     }
 
-    // 7. Escrita Final
+    // 8. Escrita Final
     if (fseek(file, req->offset, SEEK_SET) != 0) {
         perror("Servidor: ERRO (WR) Falha no fseek para o offset");
         res->offset = SFP_ERR_IO;

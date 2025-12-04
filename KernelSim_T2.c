@@ -35,69 +35,75 @@
 #include <sys/types.h>
 #include <fcntl.h>
 
-#include "sfp_protocol.h"
+#include "sfp_protocol.h"   /* Define SfpMessage e tipos RD/WR/DC/DR/DL */
 
 /* ---------------- Configuration ---------------- */
 
 #define N_APPS       5
-#define MAX_BLOCKED  (N_APPS * 3) /* filas de respostas podem acumular um pouco mais */
-#define MAX_READY    N_APPS
-#define QUANTUM_US   500000     /* 0.5 s quantum for apps/interrupt pacing */
-#define MAX_PC       20         /* max instructions per app */
-#define SYSCALL_PROB 20         /* 1 in SYSCALL_PROB chance per tick */
+#define MAX_BLOCKED  (N_APPS * 3) /* Tam. das filas de respostas (arquivo/dir) vindas do SFSS */
+#define MAX_READY    N_APPS       /* No máx. todos os apps podem estar READY */
+#define QUANTUM_US   500000       /* 0.5 s quantum para apps e IC */
+#define MAX_PC       20           /* Máx. “instruções” (iterações) por app */
+#define SYSCALL_PROB 20           /* Chance de 1/SYSCALL_PROB de syscall por tick */
 
 /* IRQ probabilities (lower to match spec: ~0.1 for file, ~0.02 for dir) */
-#define IRQ1_PROB_DEN 10  /* 1/IRQ1_PROB_DEN chance for IRQ1 generation */
-#define IRQ2_PROB_DEN 20  /* 1/IRQ2_PROB_DEN chance for IRQ2 generation */
+#define IRQ1_PROB_DEN 10  /* 1/IRQ1_PROB_DEN chance para IRQ1 (arquivo) */
+#define IRQ2_PROB_DEN 20  /* 1/IRQ2_PROB_DEN chance para IRQ2 (diretório) */
 
-#define SFSS_HOST "127.0.0.1"
-#define SFSS_PORT 8888
+#define SFSS_HOST "127.0.0.1"  /* SFSS local (poderia ser IP remoto) */
+#define SFSS_PORT 8888         /* Porta do servidor de arquivos */
 
-#define SHM_KEY_BASE 0x1316
+#define SHM_KEY_BASE 0x1316    /* Base para gerar uma shmem por app */
 
 /* ---------------- Types & Globals ---------------- */
 
+/* Estados possíveis do processo na visão do kernel */
 enum ProcState { READY = 0, RUNNING = 1, BLOCKED = 2, TERMINATED = 3 };
 
+/* PCB = Process Control Block mantido pelo kernel */
 typedef struct PCB {
-    pid_t pid;                 /* OS PID of process */
-    int   id;                  /* logical ID A1..AN (1..N_APPS) */
-    int   state;               /* ProcState */
-    int   pc;                  /* last program counter observed */
-    SfpMessage pending_syscall;/* saved syscall for snapshot */
+    pid_t pid;                 /* PID real do processo no Linux */
+    int   id;                  /* ID lógico A1..AN (1..N_APPS) */
+    int   state;               /* Estado (READY/RUNNING/BLOCKED/TERMINATED) */
+    int   pc;                  /* Último valor de PC observado (para snapshot) */
+    SfpMessage pending_syscall;/* Última syscall salva apenas para debug/snapshot */
 } PCB;
 
-/* Global PCBs and scheduler structures */
+/* Vetor global de PCBs e controle do escalonador */
 static PCB pcbs[N_APPS];
-static int running_idx = -1;
+static int running_idx = -1;   /* Índice do processo atualmente em execução, ou -1 */
 
-/* Queues to hold responses coming from SFSS (replies) */
+/* Filas para guardar respostas vindas do SFSS (replies) */
+/* Uma fila para operações de arquivo (RD/WR) */
 static SfpMessage file_req_q[MAX_BLOCKED];
-static int fq_h = 0, fq_t = 0, fq_sz = 0;
+static int fq_h = 0, fq_t = 0, fq_sz = 0;  /* head, tail, size */
 
+/* Outra fila para operações de diretório (DC/DR/DL) */
 static SfpMessage dir_req_q[MAX_BLOCKED];
 static int dq_h = 0, dq_t = 0, dq_sz = 0;
 
-/* Ready queue (round-robin) */
+/* Fila de prontos (round-robin), armazena índices de PCBs */
 static int rq[MAX_READY];
 static int rq_h = 0, rq_t = 0, rq_sz = 0;
 
-/* Pipes descriptors for intercontroller and apps (kernel reads) */
-static int inter_r = -1, app_r = -1;
-static pid_t inter_pid = -1;
+/* Descritores de leitura dos pipes (kernel lê desses lados) */
+static int inter_r = -1, app_r = -1;  /* inter_r: IC→kernel, app_r: apps→kernel */
+static pid_t inter_pid = -1;          /* PID do processo interrupt controller */
 
-/* Network and shared memory */
-static int udp_sockfd = -1;
-static struct sockaddr_in sfss_addr;
-static int shm_ids[N_APPS];
-static SfpMessage* shm_ptrs[N_APPS];
+/* Network e memória compartilhada */
+static int udp_sockfd = -1;          /* socket UDP usado pelo kernel */
+static struct sockaddr_in sfss_addr; /* endereço do SFSS (IP+porta) */
 
-/* Flags for signals */
-static volatile sig_atomic_t inter_pending = 0;
-static volatile sig_atomic_t app_pending   = 0;
-static volatile sig_atomic_t want_snapshot = 0;
-static volatile sig_atomic_t want_resume   = 0;
-static int paused = 0;
+static int shm_ids[N_APPS];          /* IDs das regiões de shmem (System V) */
+static SfpMessage* shm_ptrs[N_APPS]; /* Ponteiros mapeados para cada shmem (uma por app) */
+
+/* Flags para sinalizar eventos vindos de sinais (handlers são simples) */
+static volatile sig_atomic_t inter_pending = 0; /* SIGUSR1: algo do IC chegou no pipe inter_r */
+static volatile sig_atomic_t app_pending   = 0; /* SIGUSR2: algo dos apps chegou no pipe app_r */
+static volatile sig_atomic_t want_snapshot = 0; /* SIGINT: usuário pediu snapshot (Ctrl+C) */
+static volatile sig_atomic_t want_resume   = 0; /* SIGCONT: retomar se estiver pausado */
+static int paused = 0;                          /* usado para pausar/retomar o kernel */
+
 
 /* Local intercontroller pause flag (used inside inter process) */
 static volatile sig_atomic_t ic_paused = 0;
@@ -427,8 +433,13 @@ static void run_app(int id) {
                 case 1: { /* WRITE */
                     char path[128];
                     snprintf(path, sizeof(path), "/A%d/file.txt", (rand()%2==0)?id:0);
-                    snprintf(msg, sizeof(msg), "WRITE A%d %d %s %d HelloA%dPC%d\n",
-                             id, (int)getpid(), path, offset, id, pc);
+                    /* payload preenchido com espacos para evitar NULs residuais */
+                    char payload[SFP_PAYLOAD_SIZE + 1];
+                    memset(payload, ' ', SFP_PAYLOAD_SIZE);
+                    payload[SFP_PAYLOAD_SIZE] = '\0';
+                    snprintf(payload, SFP_PAYLOAD_SIZE + 1, "HelloA%dPC%d", id, pc);
+                    snprintf(msg, sizeof(msg), "WRITE A%d %d %s %d %s\n",
+                             id, (int)getpid(), path, offset, payload);
                     break;
                 }
                 case 2: { /* ADD (directory create) */
@@ -831,6 +842,7 @@ static void drain_apps(void) {
                 /* block the process and save pending syscall for snapshot */
                 pcbs[idx].state = BLOCKED;
                 pcbs[idx].pending_syscall = req_msg;
+                kill(pcbs[idx].pid, SIGSTOP);
                 fprintf(stderr, "[Kernel] SYSCALL A%d (PID %d): MSG %d -> BLOCKED\n",
                         idx + 1, pid, req_msg.msg_type);
 
